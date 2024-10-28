@@ -33,6 +33,7 @@ import org.jooq.SQLDialect;
 import org.jooq.conf.Settings;
 import org.jooq.impl.DSL;
 import org.jooq.impl.DefaultConnectionProvider;
+import org.jooq.tools.jdbc.JDBCUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -47,8 +48,7 @@ class JooqPersistService implements Provider<DSLContext>, UnitOfWork, PersistSer
 
   private static final Logger logger = LoggerFactory.getLogger(JooqPersistService.class);
 
-  private final ThreadLocal<DSLContext> threadFactory = new ThreadLocal<DSLContext>();
-  private final ThreadLocal<DefaultConnectionProvider> threadConnection = new ThreadLocal<DefaultConnectionProvider>();
+  private static final ThreadLocal<ThreadLocals> threadFactory = new ThreadLocal<>();
   private final Provider<DataSource> jdbcSource;
   private final SQLDialect sqlDialect;
   private final Settings jooqSettings;
@@ -68,86 +68,94 @@ class JooqPersistService implements Provider<DSLContext>, UnitOfWork, PersistSer
     }
   }
 
+  @Override
   public DSLContext get() {
-    DSLContext factory = threadFactory.get();
-    if(null == factory) {
+    ThreadLocals factory = threadFactory.get();
+    if (null == factory) {
       throw new IllegalStateException("Requested Factory outside work unit. "
               + "Try calling UnitOfWork.begin() first, use @Transactional annotation"
               + "or use a PersistFilter if you are inside a servlet environment.");
     }
 
-    return factory;
+    return factory.getDSLContext();
   }
 
-  public DefaultConnectionProvider getConnectionWrapper() {
-	  return threadConnection.get();
+  public ThreadLocals getThreadLocals() {
+	  return threadFactory.get();
   }
 
   public boolean isWorking() {
     return threadFactory.get() != null;
   }
 
+  @Override
   public void begin() {
-    if(null != threadFactory.get()) {
+    if (null != threadFactory.get()) {
       throw new IllegalStateException("Work already begun on this thread. "
               + "It looks like you have called UnitOfWork.begin() twice"
               + " without a balancing call to end() in between.");
     }
 
-    DefaultConnectionProvider conn;
+    threadFactory.set(createThreadLocals());
+  }
+
+  private ThreadLocals createThreadLocals() {
+    DefaultConnectionProvider conn = null;
     try {
       logger.debug("Getting JDBC connection");
       DataSource dataSource = jdbcSource.get();
       Connection jdbcConn = dataSource.getConnection();
       conn = new DefaultConnectionProvider(jdbcConn);
-    } catch (SQLException e) {
+
+      DSLContext jooqFactory;
+
+      if (configuration != null) {
+        logger.debug("Creating factory from configuration having dialect {}", configuration.dialect());
+        jooqFactory = DSL.using(conn, configuration.dialect(), configuration.settings());
+      } else {
+        if (jooqSettings == null) {
+          logger.debug("Creating factory with dialect {}", sqlDialect);
+          jooqFactory = DSL.using(conn, sqlDialect);
+        } else {
+          logger.debug("Creating factory with dialect {} and settings.", sqlDialect);
+          jooqFactory = DSL.using(conn, sqlDialect, jooqSettings);
+        }
+      }
+      return new ThreadLocals(jooqFactory, conn);
+    } catch (Exception e) {
+      if (conn != null) {
+        JDBCUtils.safeClose(conn.acquire());
+      }
       throw new RuntimeException(e);
     }
-
-    DSLContext jooqFactory;
-
-    if (configuration != null) {
-      logger.debug("Creating factory from configuration having dialect {}", configuration.dialect());
-      jooqFactory = DSL.using(conn, configuration.dialect(), configuration.settings());
-    } else {
-      if (jooqSettings == null) {
-        logger.debug("Creating factory with dialect {}", sqlDialect);
-        jooqFactory = DSL.using(conn, sqlDialect);
-      } else {
-        logger.debug("Creating factory with dialect {} and settings.", sqlDialect);
-        jooqFactory = DSL.using(conn, sqlDialect, jooqSettings);
-      }
-    }
-    threadConnection.set(conn);
-    threadFactory.set(jooqFactory);
   }
 
+  @Override
   public void end() {
-	  DSLContext jooqFactory = threadFactory.get();
-	  DefaultConnectionProvider conn = threadConnection.get();
+    ThreadLocals threadLocals = threadFactory.get();
     // Let's not penalize users for calling end() multiple times.
-    if (null == jooqFactory) {
+    if (null == threadLocals) {
       return;
     }
 
     try {
       logger.debug("Closing JDBC connection");
-      conn.acquire().close();
+      threadLocals.getConnectionProvider().acquire().close();
     } catch (SQLException e) {
       throw new RuntimeException(e);
+    } finally {
+      threadFactory.remove();
     }
-    threadFactory.remove();
-    threadConnection.remove();
   }
 
 
+  @Override
   public synchronized void start() {
 	  //nothing to do on start
   }
 
+  @Override
   public synchronized void stop() {
 	  //nothing to do on stop
   }
-
-
 }

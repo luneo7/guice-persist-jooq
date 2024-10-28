@@ -35,7 +35,7 @@ import org.slf4j.LoggerFactory;
  */
 class JdbcLocalTxnInterceptor implements MethodInterceptor {
   private static final Logger logger = LoggerFactory.getLogger(JdbcLocalTxnInterceptor.class);
-  private static final ConcurrentMap<Method, Transactional> methodsTransactionals = new ConcurrentHashMap<Method, Transactional>();
+  private static final ConcurrentMap<Method, Transactional> transactionalMethods = new ConcurrentHashMap<Method, Transactional>();
 
   private final Provider<JooqPersistService> jooqPersistServiceProvider;
   private final Provider<UnitOfWork> unitOfWorkProvider;
@@ -44,9 +44,6 @@ class JdbcLocalTxnInterceptor implements MethodInterceptor {
   private static class Internal {
   }
 
-  // Tracks if the unit of work was begun implicitly by this transaction.
-  private final ThreadLocal<Boolean> didWeStartWork = new ThreadLocal<Boolean>();
-
   @Inject
   public JdbcLocalTxnInterceptor(Provider<JooqPersistService> jooqPersistServiceProvider,
                                  Provider<UnitOfWork> unitOfWorkProvider) {
@@ -54,92 +51,76 @@ class JdbcLocalTxnInterceptor implements MethodInterceptor {
     this.unitOfWorkProvider = unitOfWorkProvider;
   }
 
+  @Override
   public Object invoke(final MethodInvocation methodInvocation) throws Throwable {
     UnitOfWork unitOfWork = unitOfWorkProvider.get();
     JooqPersistService jooqProvider = jooqPersistServiceProvider.get();
 
-    // Should we start a unit of work?
-    if (!jooqProvider.isWorking()) {
-      unitOfWork.begin();
-      didWeStartWork.set(true);
-    }
-
-    Transactional transactional = readTransactionMetadata(methodInvocation);
-    DefaultConnectionProvider conn = jooqProvider.getConnectionWrapper();
-
-    // Allow 'joining' of transactions if there is an enclosing @Transactional method.
-    if (!conn.getAutoCommit()) {
+    if (jooqProvider.isWorking()) {
+      // Allow 'joining' of transactions if there is an enclosing @Transactional method.
       return methodInvocation.proceed();
+    } else {
+      // We should start a unit of work
+      unitOfWork.begin();
     }
 
-    logger.debug("Disabling JDBC auto commit for this thread");
-    conn.setAutoCommit(false);
-
-    Object result;
+    DefaultConnectionProvider conn = jooqProvider.getThreadLocals().getConnectionProvider();
+    boolean reenableAutoCommit = false;
 
     try {
-      result = methodInvocation.proceed();
+      if (conn.getAutoCommit()) {
+        logger.debug("Disabling JDBC auto commit for this thread");
+        reenableAutoCommit = true;
+        conn.setAutoCommit(false);
+      }
+
+      Object result = methodInvocation.proceed();
+
+      logger.debug("Committing JDBC transaction");
+      conn.commit();
+
+      return result;
     } catch (Exception e) {
       //commit transaction only if rollback didn't occur
-      if (rollbackIfNecessary(transactional, e, conn)) {
+      if (rollbackIfNecessary(readTransactionMetadata(methodInvocation), e, conn)) {
         logger.debug("Committing JDBC transaction");
         conn.commit();
       }
-
-      logger.debug("Enabling auto commit for this thread");
-      conn.setAutoCommit(true);
-
       //propagate whatever exception is thrown anyway
       throw e;
     } finally {
       // Close the em if necessary (guarded so this code doesn't run unless catch fired).
-      if (null != didWeStartWork.get() && conn.getAutoCommit()) {
-        didWeStartWork.remove();
+        if (reenableAutoCommit) {
+          try {
+           conn.setAutoCommit(true);
+          } catch (Exception ignored) {
+          }
+        }
         unitOfWork.end();
-      }
     }
-
-    // everything was normal so commit the txn (do not move into try block above as it
-    // interferes with the advised method's throwing semantics)
-    try {
-      logger.debug("Committing JDBC transaction");
-      conn.commit();
-      logger.debug("Enabling auto commit for this thread");
-      conn.setAutoCommit(true);
-    } finally {
-      //close the em if necessary
-      if (null != didWeStartWork.get()) {
-        didWeStartWork.remove();
-        unitOfWork.end();
-      }
-    }
-
-    //or return result
-    return result;
   }
 
   private Transactional readTransactionMetadata(final MethodInvocation methodInvocation) {
     Method method = methodInvocation.getMethod();
-    Transactional cachedTransactional = methodsTransactionals.get(method);
+    Transactional cachedTransactional = transactionalMethods.get(method);
     if (cachedTransactional != null) {
       return cachedTransactional;
     }
 
-    Transactional transactional = method.getAnnotation(Transactional.class);
-    if (null == transactional) {
-      // If none on method, try the class.
-      Class<?> targetClass = methodInvocation.getThis().getClass();
-      transactional = targetClass.getAnnotation(Transactional.class);
-    }
-
-    if (null != transactional) {
-      methodsTransactionals.put(method, transactional);
-    } else {
-      // If there is no transactional annotation present, use the default
-      transactional = Internal.class.getAnnotation(Transactional.class);
-    }
-
-    return transactional;
+    return transactionalMethods.computeIfAbsent(method, ignored -> {
+        Transactional transactional;
+        transactional = method.getAnnotation(Transactional.class);
+        if (null == transactional) {
+            // If none on method, try the class.
+            Class<?> targetClass = methodInvocation.getThis().getClass();
+            transactional = targetClass.getAnnotation(Transactional.class);
+        }
+        if (null == transactional) {
+            // If there is no transactional annotation present, use the default
+            transactional = Internal.class.getAnnotation(Transactional.class);
+        }
+        return transactional;
+    });
   }
 
   /**
@@ -147,7 +128,7 @@ class JdbcLocalTxnInterceptor implements MethodInterceptor {
    *
    * @param transactional The metadata annotation of the method
    * @param e             The exception to test for rollback
-   * @param txn           A JPA Transaction to issue rollbacks on
+   * @param conn          A DefaultConnectionProvider to issue rollbacks on
    */
   private boolean rollbackIfNecessary(final Transactional transactional,
                                       final Exception e,

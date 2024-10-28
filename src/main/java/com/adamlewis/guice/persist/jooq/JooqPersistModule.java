@@ -46,7 +46,6 @@ public final class JooqPersistModule extends PersistModule {
 
     transactionInterceptor = new JdbcLocalTxnInterceptor(getProvider(JooqPersistService.class),
                                                          getProvider(UnitOfWork.class));
-    requestInjection(transactionInterceptor);
   }
 
   @Override
