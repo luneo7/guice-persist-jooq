@@ -7,6 +7,8 @@ import com.adamlewis.guice.persist.jooq.utils.Providers;
 import com.google.inject.persist.Transactional;
 import com.google.inject.persist.UnitOfWork;
 import org.aopalliance.intercept.MethodInvocation;
+import org.jooq.SQLDialect;
+import org.jooq.impl.DSL;
 import org.jooq.impl.DefaultConnectionProvider;
 import org.junit.Before;
 import org.junit.Test;
@@ -43,7 +45,8 @@ public class JdbcLocalTxnInterceptorTest {
     connection.setAutoCommit(true);
 
     DefaultConnectionProvider connectionProvider = new DefaultConnectionProvider(connection);
-    when(jooqPersistService.getConnectionWrapper()).thenReturn(connectionProvider);
+    when(jooqPersistService.getThreadLocals()).thenReturn(new ThreadLocals(DSL.using(SQLDialect.DEFAULT),
+                                                                           connectionProvider));
     when(jooqPersistService.isWorking()).thenReturn(false);
 
     // Method is final. Mockito doesn't support mocking final classes. Using reflection

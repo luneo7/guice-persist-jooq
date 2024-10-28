@@ -12,6 +12,7 @@ import com.google.inject.Module;
 import javax.sql.DataSource;
 import org.jooq.Configuration;
 import org.jooq.conf.BackslashEscaping;
+import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
@@ -27,6 +28,17 @@ public class JooqPersistServiceTest {
   public void setup() {
     injector = null;
   }
+
+  @After
+  public void tearDown() {
+      if (injector != null) {
+          JooqPersistService instance = injector.getInstance(JooqPersistService.class);
+          if (instance.isWorking()) {
+              instance.end();
+          }
+      }
+  }
+
 
   @Test
   public void canCreateWithoutConfiguration() {
@@ -65,8 +77,11 @@ public class JooqPersistServiceTest {
   }
 
   @Test
-  public void canProvideSettingsAndConfigurationButSettingsIsIgnored() {
+  public void canProvideSettingsAndConfigurationButSettingsIsIgnored() throws Exception  {
     JooqPersistService jooqPersistService = givenJooqPersistServiceWithModule(new ConfigurationModule(), new SettingsModule());
+    DataSource dataSource = injector.getInstance(DataSource.class);
+    Connection connectionMock = mock(Connection.class);
+    when(dataSource.getConnection()).thenReturn(connectionMock);
     jooqPersistService.begin();
 
     Configuration configuration = injector.getInstance(Configuration.class);
